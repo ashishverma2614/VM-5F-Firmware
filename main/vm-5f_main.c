@@ -11,27 +11,38 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "esp_system.h"
-#include "esp_log.h"
 #include "driver/gpio.h"
 #include "driver/uart.h"
 #include "soc/uart_struct.h"
+#include "vm-5f.c"
     
 /*
- * - Port: UART1
+ * - Port: UART2
  * - Receive (Rx) buffer: on
  * - Transmit (Tx) buffer: on
  * - Flow control: off
  * - Event queue: off
  * - Pin assignment: see defines below
  */
+#define TXD_PIN          17
+#define RXD_PIN          16
+#define GPIO_OUTPUT_IO_0 5                                                          //EN Pin for the RFID Reader.
+#define GPIO_OUTPUT_IO_1 18                                                         //EN Pin for the Relay to control the EM Door.
+#define GPIO_OUTPUT_PIN_SEL  ((1ULL<<GPIO_OUTPUT_IO_0) | (1ULL<<GPIO_OUTPUT_IO_1))
+#define GPIO_INPUT_IO_0  19                                                         //STOP Switch(pull down) to unlock the Door.
+#define GPIO_INPUT_PIN_SEL  (1ULL<<GPIO_INPUT_IO_0)
+#define ESP_INTR_FLAG_DEFAULT 0
 
-static const int BUF_SIZE = 256;
+#define TAG_LENGTH 12                                                               //Length of EPC Number of 1 UHF RFID Tag.
+#define RELAY_TRIGGER_TIME 4000                                                     //Delay time before switching OFF the EM Lock/Relay.
 
-#define TXD_PIN (GPIO_NUM_17)
-#define RXD_PIN (GPIO_NUM_16)
+static const int RX_BUF_SIZE = 512;
+static xQueueHandle tag_found_queue = NULL;
 
-//Intializing UART and GPIO 
-void init() {                                                           
+//Intializing UART
+void init() 
+{                         
+    /*****UART Config*****/                                  
     const uart_config_t uart_config = {
         .baud_rate = 115200,
         .data_bits = UART_DATA_8_BITS,
@@ -41,268 +52,216 @@ void init() {
     };
     uart_param_config(UART_NUM_2, &uart_config);
     uart_set_pin(UART_NUM_2, TXD_PIN, RXD_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-    uart_driver_install(UART_NUM_2, BUF_SIZE , BUF_SIZE , 0, NULL, 0);
+    uart_driver_install(UART_NUM_2, RX_BUF_SIZE * 2 ,0 , 0, NULL, 0);
 }
 
-//Host Command Data Packet Definition.
-typedef struct Data_packet                                  
+//Setting up GPIOs
+void gpio_setup()
 {
-    unsigned char head;
-    unsigned char len;
-    unsigned char add;
-    unsigned char cmd;
-    unsigned char data[4];
-    unsigned char check;
-        
-}Data_packet;
-/*
-//Send data to the VM-5F RFID Reader.
-int sendData(const char* data)
-{
-    const int len = sizeof(Data_packet);
-    const int txBytes = uart_write_bytes(UART_NUM_2, data, len);
-    printf("Data send length: %d\n", len);
-    return txBytes;
-}
-*/
-//Reset the RFID Reader.
-int resetVM_5F()
-{
-    struct Data_packet *dpack, d2;
-    d2.head     = 0x0A;
-    d2.len      = 0x03;
-    d2.add      = 0xFF;
-    d2.cmd      = 0x70;
-    //d2.data[0]  = 0x00; d2.data[1] = 0x00; d2.data[2] = 0x00; d2.data[3] = 0x00;
-    d2.check    = sizeof(d2.head + d2.len + d2.add + d2.cmd + d2.data);
-
-    dpack = &d2;
-    const int len = sizeof(Data_packet);
-    const int txBytes = uart_write_bytes(UART_NUM_2, (const char*) dpack, len);
-    printf("Command send: %02x \n", dpack->cmd);
-    return txBytes;
-}
-
-//Get VM-5F RFID Reader Firmware Version.
-int getFirmware()
-{
-    struct Data_packet *dpack, d1;
-    d1.head     = 0x0A;
-    d1.len      = 0x03;
-    d1.add      = 0x01;
-    d1.cmd      = 0x72;
-    //d1.data[0]  = 0xEC; d1.data[1] = 0x00; d1.data[2] = 0x00; d1.data[3] = 0x00;
-    //d1.data[]   = {0xEC, 0x00, 0x00, 0x00};
-    d1.check    = sizeof(d1.head + d1.len + d1.add + d1.cmd + d1.data);
-
-    dpack = &d1;
-    const int len = sizeof(Data_packet);
-    const int txBytes = uart_write_bytes(UART_NUM_2, (const char*) dpack, len);
-    printf("Command send: %02x \n", dpack->cmd);
-    return txBytes;
-}
-
-//Set up VM-5F RFID Reader UART baud rate to 115200 bps (0x71, 0x04).
-int setBaudRate()
-{
-    struct Data_packet *dpack, d3;
-    d3.head     = 0x0A;
-    d3.len      = 0x03;
-    d3.add      = 0x01;
-    d3.cmd      = 0x71;
-    d3.data[0]  = 0x04; //d3.data[1] = 0x00; d3.data[2] = 0x00; d3.data[3] = 0x00;
-    //d3.data     = {0x04, 0x00, 0x00, 0x00};
-    d3.check    = sizeof(d3.head + d3.len + d3.add + d3.cmd + d3.data);
-
-    dpack = &d3;
-    const int len = sizeof(Data_packet);
-    const int txBytes = uart_write_bytes(UART_NUM_2, (const char*) dpack, len);
-    printf("Command send: %02x \n", dpack->cmd);
-    //printf("txBytes sent: %d \n", sizeof(txBytes));
-    return txBytes;
-}
-
-//Set up working Antenna.
-int setWorkAntenna()
-{
-    struct Data_packet *dpack, d4;
-    d4.head     = 0x0A;
-    d4.len      = 0x04;
-    d4.add      = 0xFF;
-    d4.cmd      = 0x74;
-    d4.data[0]  = 0x00; //d4.data[1] = 0x00; d4.data[2] = 0x00; d4.data[3] = 0x00;
-    //d3.data     = {0x04, 0x00, 0x00, 0x00};
-    d4.check    = sizeof(d4.head + d4.len + d4.add + d4.cmd + d4.data);
-
-    dpack = &d4;
-    const int len = sizeof(Data_packet);
-    const int txBytes = uart_write_bytes(UART_NUM_2, (const char*) dpack, len);
-    printf("Command send: %02x \n", dpack->cmd);
-    //printf("txBytes sent: %d \n", sizeof(txBytes));
-    return txBytes;
-}
-
-//Set up RF Output Power(from 20 to 33 dBm, 0x14 to 0x21, resp).
-int setOutputPower()
-{
-    struct Data_packet *dpack, d5;
-    d5.head     = 0x0A;
-    d5.len      = 0x04;
-    d5.add      = 0xFF;
-    d5.cmd      = 0x76;
-    d5.data[0]  = 0x20; //d4.data[1] = 0x00; d4.data[2] = 0x00; d4.data[3] = 0x00;
-    //d3.data     = {0x04, 0x00, 0x00, 0x00};
-    d5.check    = sizeof(d5.head + d5.len + d5.add + d5.cmd + d5.data);
-
-    dpack = &d5;
-    const int len = sizeof(Data_packet);
-    const int txBytes = uart_write_bytes(UART_NUM_2, (const char*) dpack, len);
-    printf("Command send: %02x \n", dpack->cmd);
-    //printf("txBytes sent: %d \n", sizeof(txBytes));
-    return txBytes;
-}
-
-//Set up RF Frequency Spectrum(we will use ETSI Spectrum Regulation, with Freq Range: (0x00)865.00 MHz to (0x06)868.00 MHz).
-int setFreqRegion()
-{
-    struct Data_packet *dpack, d6;
-    d6.head     = 0x0A;
-    d6.len      = 0x04;
-    d6.add      = 0xFF;
-    d6.cmd      = 0x78;
-    d6.data[0]  = 0x02; d6.data[1] = 0x00; d6.data[2] = 0x06; //d6.data[3] = 0x00;
-    //d3.data     = {0x04, 0x00, 0x00, 0x00};
-    d6.check    = sizeof(d6.head + d6.len + d6.add + d6.cmd + d6.data);
-
-    dpack = &d6;
-    const int len = sizeof(Data_packet);
-    const int txBytes = uart_write_bytes(UART_NUM_2, (const char*) dpack, len);
-    printf("Command send: %02x \n", dpack->cmd);
-    //printf("txBytes sent: %d \n", sizeof(txBytes));
-    return txBytes;
-}
-
-//Set DRM Mode.
-int setDRM()
-{
-    struct Data_packet *dpack, d7;
-    d7.head     = 0x0A;
-    d7.len      = 0x04;
-    d7.add      = 0xFF;
-    d7.cmd      = 0x7C;
-    d7.data[0]  = 0x01; //d7.data[1] = 0x06; d7.data[2] = 0x00; d7.data[3] = 0x00;
-    //d3.data     = {0x04, 0x00, 0x00, 0x00};
-    d7.check    = sizeof(d7.head + d7.len + d7.add + d7.cmd + d7.data);
+        /*****GPIO Config*****/
     
-    dpack = &d7;
-    const int len = sizeof(Data_packet);
-    const int txBytes = uart_write_bytes(UART_NUM_2, (const char*) dpack, len);
-    printf("Command send: %02x \n", dpack->cmd);
-    //printf("txBytes sent: %d \n", sizeof(txBytes));
-    return txBytes;
+    gpio_config_t io_conf;
+    //disable interrupt
+    io_conf.intr_type = GPIO_PIN_INTR_DISABLE;
+    //bit mask of the pins that you want to set as output, GPIO5/18 here
+    io_conf.pin_bit_mask = GPIO_OUTPUT_PIN_SEL;
+    //set as output mode
+    io_conf.mode = GPIO_MODE_OUTPUT;
+    //disable pull-down mode
+    io_conf.pull_down_en = 0;
+    //able pull-up mode
+    io_conf.pull_up_en = 0;
+    //configure GPIO with the given settings
+    gpio_config(&io_conf);
+
+    //Disable interrupt
+    io_conf.intr_type = GPIO_PIN_INTR_DISABLE;
+    //bit mask of the pins, use GPIO19 here
+    io_conf.pin_bit_mask = GPIO_INPUT_PIN_SEL;
+    //set as input mode    
+    io_conf.mode = GPIO_MODE_INPUT;
+    //disable pull-down mode
+    io_conf.pull_down_en = 0;
+    //enable pull-up mode
+    io_conf.pull_up_en = 1;
+    gpio_config(&io_conf);
 }
 
-//Set Antenna Detection On/Off.
-int setAntDetect()
+//Function to get Data from RFID Reader in RData_packet structure.
+unsigned char getData()
 {
-    struct Data_packet *dpack, d8;
-    d8.head     = 0x0A;
-    d8.len      = 0x04;
-    d8.add      = 0xFF;
-    d8.cmd      = 0x62;
-    d8.data[0]  = 0x01; //d8.data[1] = 0x06; d8.data[2] = 0x00; d8.data[3] = 0x00;
-    //d3.data     = {0x04, 0x00, 0x00, 0x00};
-    d8.check    = sizeof(d8.head + d8.len + d8.add + d8.cmd + d8.data);
-    
-    dpack = &d8;
-    const int len = sizeof(Data_packet);
-    const int txBytes = uart_write_bytes(UART_NUM_2, (const char*) dpack, len);
-    printf("Command send: %02x \n", dpack->cmd);
-    //printf("txBytes sent: %d \n", sizeof(txBytes));
-    return txBytes;
-}
+    uint8_t* data = (uint8_t*) malloc(RX_BUF_SIZE+1);
+    int j = 0;
+    struct RData_packet * dpack2;
+    dpack2 = (struct RData_packet*)data;
 
-//Set Reader Address.
-int setReadAddress()
-{
-    struct Data_packet *dpack, d9;
-    d9.head     = 0x0A;
-    d9.len      = 0x04;
-    d9.add      = 0xFF;
-    d9.cmd      = 0x62;
-    d9.data[0]  = 0x00; d9.data[1] = 0xFF; //d9.data[2] = 0xFF; d9.data[3] = 0xFF;
-    //d3.data     = {0x04, 0x00, 0x00, 0x00};
-    d9.check    = sizeof(d9.head + d9.len + d9.add + d9.cmd + d9.data);
-    
-    dpack = &d9;
-    const int len = sizeof(Data_packet);
-    const int txBytes = uart_write_bytes(UART_NUM_2, (const char*) dpack, len);
-    printf("Command send: %02x \n", dpack->cmd);
-    //printf("txBytes sent: %d \n", sizeof(txBytes));
-    return txBytes;
-}
-
-//Tx task function.
-static void tx_task()
-{   
-        //sendData( (const char*) dpack);                                                             //type casting pointer data types.            
-        //printf("Cmd send: %d\n", dpack->cmd);
-        //printf("Checksum send: %d\n\n\n", dpack->check);
-    int i = 0;
-    while(1)
-    {
-        if(i<1)
+     const int rxBytes = uart_read_bytes(UART_NUM_2, data, RX_BUF_SIZE, 1000 / portTICK_RATE_MS);
+        if(rxBytes > 0) 
         {
-            resetVM_5F();
-            vTaskDelay(1000 / portTICK_PERIOD_MS);
-            setBaudRate();
-            vTaskDelay(1000 / portTICK_PERIOD_MS);
-            setReadAddress();
-            i++;
+            data[rxBytes] = 0;
+            j = (rxBytes - 5);          //here, j = length of Data[] received(head, len, add, cmd, checksum excluded).
+            //printf("rx bytes:   %d\n", rxBytes);
+            //printf("rx head:    %02x \n", dpack2->head);
+            //printf("rx length:  %02x \n", dpack2->len);
+            //printf("rx address: %02x \n", dpack2->add);
+            printf("rx command: %02x \n", dpack2->cmd);
+            printf("rx data:    ");
+            for(int i=0; i<j; i++)              
+            {
+                printf("%02x ", dpack2->data[i]);
+            }
+            printf("\n");
+            printf("rx checksum: %02x \n", dpack2->check);  
         }
+        free(data);
+        uart_flush(UART_NUM_2);
+        return rxBytes;       
+}
+
+//Function for Tag Detection.
+unsigned char TagDetect()
+{
+    uint8_t* tagdata = (uint8_t*) malloc(RX_BUF_SIZE+1);
+    int j = 0;
+    uint32_t tag_id;
+    struct RData_packet * dpack3;
+    dpack3 = (struct RData_packet*)tagdata;
+
+    const int rxBytes = uart_read_bytes(UART_NUM_2, tagdata, RX_BUF_SIZE, 1000 / portTICK_RATE_MS);
+        if(rxBytes > 0) 
+        {
+            tagdata[rxBytes] = 0;
+            j = (rxBytes - 5);          //here, j = length of Data[] received(head, len, add, cmd, checksum excluded).
+            
+            printf("rx command: %02x \n", dpack3->cmd);
+            if(j > 10)
+            {
+                printf("\t\t TAG FOUND!!! \n");
+                printf("Freq Ant: %02x \n", dpack3->data[0]);
+                printf("PC Bytes: %02x  %02x \n", dpack3->data[1], dpack3->data[2]);
+                
+                printf("RFID Tag EPC No: ");
+                for(int i=3; i<(TAG_LENGTH + 3); i++)              
+                {
+                    printf("%02x ", dpack3->data[i]);
+                }
+                printf("\n");
+                printf("\nRFID Tag other data: ");
+                for(int i=(TAG_LENGTH + 4); i<(j - 3); i++)              
+                {
+                    printf("%02x", dpack3->data[i]);
+                }
+                printf("\n");
+                tag_id = (uint32_t)&dpack3->data;    
+                xQueueSend(tag_found_queue, &tag_id, portMAX_DELAY);
+            }
+            else
+            {
+                printf("rx data:");
+                for(int i=0; i<j; i++)              
+                {
+                    printf(" %02x", dpack3->data[i]);
+                }
+                printf("\n");
+            }
+            printf("rx checksum: %02x \n", dpack3->check);
+        }
+    free(tagdata);
+    uart_flush(UART_NUM_2);
+    return rxBytes;
+}
+
+//GPIO interrupt handling task function
+static void gpio_task(void* arg)
+{
+    uint32_t tag_id;
     
-            getFirmware();
-            vTaskDelay(5000 / portTICK_PERIOD_MS);
-            setWorkAntenna();
-            vTaskDelay(5000 / portTICK_PERIOD_MS);
-            setOutputPower();
-            vTaskDelay(5000 / portTICK_PERIOD_MS);
-            setFreqRegion();
-            vTaskDelay(5000 / portTICK_PERIOD_MS);
-            setDRM();
-            vTaskDelay(5000 / portTICK_PERIOD_MS);
-            setAntDetect();
-            vTaskDelay(5000 / portTICK_PERIOD_MS);
+    gpio_set_level(GPIO_OUTPUT_IO_0, 1);                //set EN pin for RFID Reader High/On
+    //gpio_set_level(GPIO_OUTPUT_IO_1, 1);                //keep the Relay OFF, it's Active Low trigger
+
+    while(1) 
+    {
+        if(xQueueReceive(tag_found_queue, &tag_id, portMAX_DELAY))
+        {
+            gpio_set_level(GPIO_OUTPUT_IO_1, 0);        //Turn Relay ON, it's an Active Low trigger.
+            printf("\n\t\tDOOR LOCKED!!!\n");
+            //printf("\nRFID Tag: %d", tag_id);
+            while(gpio_get_level(GPIO_INPUT_IO_0) != 0)
+            {
+                printf("\n \tPress STOP to Unlock Door.\n");
+                vTaskDelay(100 / portTICK_RATE_MS);
+            }
+            vTaskDelay(RELAY_TRIGGER_TIME / portTICK_RATE_MS);
+            gpio_set_level(GPIO_OUTPUT_IO_1, 1);
+        }
     }
 }
 
-//Rx task function.
-static void rx_task()
-{ 
-    uint8_t* data = (uint8_t*) malloc(BUF_SIZE+1);
-    struct Data_packet *dpack2;
+//RFID UART communication task function.
+static void rfid_task()
+{   
+            //resetVM_5F();
+            //getData();
+            //vTaskDelay(100 / portTICK_PERIOD_MS);
+            setFreqRegion();
+            vTaskDelay(100 / portTICK_PERIOD_MS);
+            getData();
+            vTaskDelay(100 / portTICK_PERIOD_MS);
+            
+            setBaudRate();
+            vTaskDelay(100 / portTICK_PERIOD_MS);
+            getData();
+            vTaskDelay(100 / portTICK_PERIOD_MS);
+            
+            setDRM();
+            vTaskDelay(100 / portTICK_PERIOD_MS);
+            getData();
+            vTaskDelay(100 / portTICK_PERIOD_MS);
+            
+            setAntDetect();
+            vTaskDelay(100 / portTICK_PERIOD_MS);
+            getData();
+            vTaskDelay(100 / portTICK_PERIOD_MS);
+            
+            setWorkAntenna();
+            vTaskDelay(100 / portTICK_PERIOD_MS);
+            getData();
+            vTaskDelay(100 / portTICK_PERIOD_MS);
+            
+            setOutputPower();
+            vTaskDelay(100 / portTICK_PERIOD_MS);
+            getData();
+            vTaskDelay(100 / portTICK_PERIOD_MS);
+            
+            getFirmware();
+            vTaskDelay(100 / portTICK_PERIOD_MS);
+            getData();
+            vTaskDelay(100 / portTICK_PERIOD_MS);
 
+            printf("\n\t***SYSTEM READY***\n\n");
+            
     while(1)
     {
-        const int rxBytes = uart_read_bytes(UART_NUM_2, data, BUF_SIZE, 1000 / portTICK_RATE_MS);
-        dpack2 = (struct Data_packet*)data;
-        if(rxBytes >= 0) {
-            data[rxBytes] = 0;
-            printf("%d\n", rxBytes);
-            printf("rx head: %02x \n", dpack2->head);
-            printf("rx length: %02x \n", dpack2->len);
-            printf("rx address: %02x \n", dpack2->add);
-            printf("rx data: %02x \n", dpack2->data[0]);
-            printf("rx checksum: %02x \n", dpack2->check);            
-            vTaskDelay(2000 / portTICK_PERIOD_MS);
-        }
+        real_time_inventory();
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+        TagDetect();
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+        
+        setWorkAntenna();
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+        getData();
+        vTaskDelay(100 / portTICK_PERIOD_MS);
     }
-    free(data);
 }
 
 void app_main()
 {
     init();
-    xTaskCreate(rx_task, "uart_rx_task", 1024*2, NULL, configMAX_PRIORITIES, NULL);
-    xTaskCreate(tx_task, "uart_tx_task", 1024*2, NULL, configMAX_PRIORITIES-1, NULL);
+    gpio_setup();
+    //create a queue to handle gpio event from isr
+    tag_found_queue = xQueueCreate(10, sizeof(uint32_t)); 
+    //start gpio task
+    xTaskCreate(gpio_task, "gpio_task", 1024*2, NULL, configMAX_PRIORITIES, NULL);
+    //start uart task
+    xTaskCreate(rfid_task, "uart_rfid_task", 1024*2, NULL, configMAX_PRIORITIES-1, NULL);
 }
